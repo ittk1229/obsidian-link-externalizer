@@ -1,4 +1,3 @@
-import { link } from "fs";
 import {
 	App,
 	Editor,
@@ -8,6 +7,7 @@ import {
 	Plugin,
 	PluginSettingTab,
 	Setting,
+	parseLinktext,
 } from "obsidian";
 
 // Remember to rename these classes and interfaces!
@@ -52,7 +52,7 @@ export default class MyPlugin extends Plugin {
 				let wholePageText = view.data;
 				if (!this.settings.includeFrontmatter) {
 					wholePageText = wholePageText.replace(
-						/---\n(.|\n)*?\n---\n/,
+						/^---\n[\s\S]*?\n---\n/,
 						""
 					);
 				}
@@ -97,74 +97,84 @@ export default class MyPlugin extends Plugin {
 		this.addSettingTab(new SampleSettingTab(this.app, this));
 	}
 
-	private getExternalLinks() {
+	private getExternalLinks(): Record<string, string> {
 		const activeFile = this.app.workspace.getActiveFile();
 		if (!activeFile) {
 			new Notice("No active file.");
-			return;
+			return {};
 		}
 
 		const activeFileCache = this.app.metadataCache.getFileCache(activeFile);
 		if (!activeFileCache || !activeFileCache.links) {
 			new Notice("No links found in the active file.");
-			return;
+			return {};
 		}
 
-		const externalLinks = {};
+		const externalLinks: Record<string, string> = {};
+		const fieldName =
+			this.settings.fieldName?.trim() || DEFAULT_SETTINGS.fieldName;
+		let resolvedLinkFound = false;
 
-		activeFileCache.links.forEach((link) => {
-			const fileName = link.link.split(/[#^|]/)[0];
+		for (const linkMeta of activeFileCache.links) {
+			console.log(linkMeta);
+			const fileName = linkMeta.link;
+			if (externalLinks[fileName]) continue;
 
-			if (externalLinks[fileName]) return;
-			externalLinks[fileName] = null;
-
+			// ファイルを取得
 			const linkedFile = this.app.metadataCache.getFirstLinkpathDest(
 				fileName,
 				"/"
 			);
-			if (!linkedFile) {
-				console.log(link.link, "1. No linked file.");
-				return;
-			}
-			// ファイルを取得
+			if (!linkedFile) continue;
 			const linkedFileCache =
 				this.app.metadataCache.getFileCache(linkedFile);
-			if (!linkedFileCache) {
-				console.log(link.link, "2. No linked file cache.");
-				return;
-			}
+			if (!linkedFileCache) continue;
 			// ファイルの frontmatter を取得
-			if (!linkedFileCache.frontmatter) {
-				console.log(link.link, "3. No frontmatter found.");
-				return;
-			}
+			if (!linkedFileCache.frontmatter) continue;
 			const frontmatter = linkedFileCache.frontmatter;
-			// frontmatter から url を取得
-			if (!frontmatter.url) {
-				console.log(link.link, "4. No url found.");
-				return;
-			}
-			const url = frontmatter[this.settings.fieldName];
+			// frontmatter から指定されたフィールド名の値を取得
+			const url = frontmatter[fieldName];
+			if (!url) continue;
 
-			externalLinks[fileName] = url;
-		});
+			externalLinks[fileName] ??= url;
+			resolvedLinkFound = true;
+		}
+
+		if (!resolvedLinkFound) {
+			new Notice(`No '${fieldName}' values found in linked frontmatter.`);
+		}
 
 		return externalLinks;
 	}
 
-	private externalizeText(text: string, externalLinks: object) {
-		const result = text.replace(/\[\[(.+?)\]\]/g, (match, p1) => {
-			// #: link to heading
-			// ^: link to block
-			// |: alias
-			const [linkText, alias] = p1.split("|");
-			const fileName = linkText.split(/[#^]/)[0];
-			const displayText = alias || linkText;
-			if (!externalLinks[fileName]) return displayText;
-			return `[${displayText}](${externalLinks[fileName]})`;
+	private externalizeText(
+		text: string,
+		externalLinks: Record<string, string>
+	) {
+		const result = text.replace(/\[\[(.+?)\]\]/g, (match, inner) => {
+			const pipeIndex = inner.indexOf("|");
+			const target = pipeIndex === -1 ? inner : inner.slice(0, pipeIndex);
+			const alias = pipeIndex === -1 ? "" : inner.slice(pipeIndex + 1);
+			const { path } = parseLinktext(target);
+			const fileName = path || target.split(/[#^]/)[0];
+			const displayText = alias || this.stripLinkDisplay(target);
+			const baseUrl = externalLinks[fileName];
+			if (!baseUrl) return displayText;
+
+			return `[${displayText}](${baseUrl})`;
 		});
 
 		return result;
+	}
+
+	private stripLinkDisplay(linkText: string) {
+		if (!linkText) return "";
+		if (linkText.startsWith("#") || linkText.startsWith("^")) {
+			return linkText.slice(1);
+		}
+		const anchorIndex = linkText.search(/[#^]/);
+		if (anchorIndex === -1) return linkText;
+		return linkText.slice(0, anchorIndex);
 	}
 
 	async loadSettings() {
